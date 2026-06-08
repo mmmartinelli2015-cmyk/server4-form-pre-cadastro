@@ -1,0 +1,19 @@
+{
+  "name": "rd-envision-records",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "server4.js",
+  "scripts": {
+    "dev": "node server4.js",
+    "start": "node server4.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
