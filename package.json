@@ -4,8 +4,11 @@
   "type": "module",
   "main": "server4.js",
   "scripts": {
-    "dev": "node server4.js",
+    "dev": "nodemon server4.js",
     "start": "node server4.js"
+  },
+  "engines": {
+    "node": "20.x"
   },
   "dependencies": {
     "cors": "^2.8.5",
