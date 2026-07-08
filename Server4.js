@@ -2,8 +2,6 @@ import express from 'express';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
 import cors from 'cors';
-import fs from 'fs';
-import path from 'path';
 
 dotenv.config();
 
@@ -26,32 +24,13 @@ const ENVISION_TRAVEL_AGENCY_SYSTEM_ACCOUNT_ID = Number(process.env.ENVISION_TRA
 const ENVISION_SYSTEM_ACCOUNT_ID               = Number(process.env.ENVISION_SYSTEM_ACCOUNT_ID || 0);
 const ENVISION_RECORD_TYPE                     = process.env.ENVISION_RECORD_TYPE || 'Person';
 
-// ======================= RECORDS MAP =======================
-const RECORDS_MAP_FILE = 'C:/Users/Migue/Desktop/records-map.json';
-
-function loadRecordsMap() {
-  try {
-    if (fs.existsSync(RECORDS_MAP_FILE)) return JSON.parse(fs.readFileSync(RECORDS_MAP_FILE, 'utf8'));
-  } catch (err) { console.warn('[RecordsMap] Erro ao carregar:', err.message); }
-  return {};
-}
-
-function saveRecordId(cpf, email, id) {
-  const map = loadRecordsMap();
-  if (cpf) {
-    map[cpf] = id;
-    map[cpf.replace(/\D/g, '')] = id;
-  }
-  if (email) map[email.toLowerCase()] = id;
-  try {
-    fs.writeFileSync(RECORDS_MAP_FILE, JSON.stringify(map, null, 2), 'utf8');
-    console.log(`[RecordsMap] Salvo: cpf=${cpf} email=${email} -> id=${id}`);
-  } catch (err) { console.warn('[RecordsMap] Erro ao salvar:', err.message); }
-}
-
 // ======================= HELPERS =======================
 function safeString(value = '') {
   return String(value ?? '').trim();
+}
+
+function onlyDigits(value = '') {
+  return String(value || '').replace(/\D/g, '');
 }
 
 function removeEmptyDeep(obj) {
@@ -139,7 +118,7 @@ async function getEnvisionToken() {
   });
 
   const text = await resp.text();
-  console.log('>> Resposta /token Envision:', resp.status, text);
+  console.log('>> Resposta /token Envision:', resp.status);
 
   let data;
   try { data = JSON.parse(text); } catch { data = { raw: text }; }
@@ -151,7 +130,7 @@ async function getEnvisionToken() {
 }
 
 // ======================= BUILD PAYLOAD =======================
-function buildEnvisionRecordPayload(formData) {
+function buildEnvisionRecordPayload(formData, existingId = null) {
   const nomeCompleto   = safeString(formData.nomeCompleto);
   const email          = safeString(formData.email);
   const cpf            = safeString(formData.cpf);
@@ -164,7 +143,6 @@ function buildEnvisionRecordPayload(formData) {
   const identification = cpf || email || `lead-${Date.now()}`;
   const summary        = `${nomeCompleto || 'Lead sem nome'} - Person Record`;
 
-  // CPF — Type '2' conforme Envision (0=RG, 1=Passaporte, 2=CPF, 3=CNH, 4=CNPJ, 5=RNE)
   const documents = [];
   if (cpf) {
     documents.push({
@@ -198,6 +176,7 @@ function buildEnvisionRecordPayload(formData) {
   }
 
   const record = {
+    ...(existingId ? { id: existingId } : {}),
     type:            ENVISION_RECORD_TYPE,
     systemAccountId: ENVISION_SYSTEM_ACCOUNT_ID,
     travelAgencyId:  ENVISION_TRAVEL_AGENCY_ID,
@@ -236,16 +215,70 @@ function buildEnvisionRecordPayload(formData) {
   });
 }
 
-// ======================= ENVIO =======================
+// ======================= LOOKUP POR EXTERNALID =======================
+async function findRecordIdByExternalId(token, cpf, email) {
+  const cpfDigits = onlyDigits(cpf);
+  const candidates = [...new Set([cpfDigits, cpf, email].filter(Boolean))];
+
+  for (const candidate of candidates) {
+    try {
+      const url = `${ENVISION_BASE_URL}/Records/Query`;
+      const body = {
+        criteria: `externalId = "${candidate}"`,
+        sortFields: [],
+        pagingPivotId: 0,
+        pagingPivotValues: [],
+        additionalInfo: {
+          travelAgencyId: ENVISION_TRAVEL_AGENCY_ID,
+          systemAccountId: ENVISION_SYSTEM_ACCOUNT_ID
+        }
+      };
+
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(body)
+      });
+
+      const text = await resp.text();
+      console.log(`[Envision] Records/Query (${candidate}) status: ${resp.status}`);
+
+      let data;
+      try { data = JSON.parse(text); } catch { data = null; }
+
+      if (resp.ok && data?.successful !== false) {
+        const records = Array.isArray(data?.records) ? data.records : [];
+        if (records[0]?.id) return records[0].id;
+      }
+    } catch (err) {
+      console.warn(`[Envision] Erro Records/Query (${candidate}):`, err.message);
+    }
+  }
+  return null;
+}
+
+// ======================= ENVIO (UPSERT) =======================
 async function sendFormToEnvision(formData, attempt = 1) {
   console.log(`>> Enviando ao Envision (tentativa ${attempt})...`);
 
-  const token   = await getEnvisionToken();
+  const token = await getEnvisionToken();
+  const cpf   = safeString(formData.cpf);
+  const email = safeString(formData.email);
+
+  const existingId = await findRecordIdByExternalId(token, cpf, email);
+  if (existingId) {
+    console.log(`[Envision] Registro existente encontrado (externalId). ID: ${existingId}. POST com id para atualizar...`);
+  } else {
+    console.log('[Envision] Nenhum registro encontrado. Criando novo...');
+  }
+
   const url     = `${ENVISION_BASE_URL}${ENVISION_FORM_ENDPOINT}`;
-  const payload = buildEnvisionRecordPayload(formData);
+  const payload = buildEnvisionRecordPayload(formData, existingId);
 
   console.log('>> URL Envision:', url);
-  console.log('>> Payload final Envision:', JSON.stringify(payload, null, 2));
 
   try {
     const resp = await fetch(url, {
@@ -258,7 +291,7 @@ async function sendFormToEnvision(formData, attempt = 1) {
     });
 
     const text = await resp.text();
-    console.log('>> Resposta Envision:', resp.status, text);
+    console.log('>> Resposta Envision:', resp.status);
 
     let data;
     try { data = JSON.parse(text); } catch { data = { raw: text }; }
@@ -267,15 +300,7 @@ async function sendFormToEnvision(formData, attempt = 1) {
       throw new Error(`Erro ao enviar dados ao Envision Records: ${resp.status} ${text}`);
     }
 
-    // Salva o ID no records-map para o server3 encontrar
-    const newId = data?.parentRecord?.id;
-    if (newId) {
-      const cpf   = safeString(formData.cpf);
-      const email = safeString(formData.email);
-      saveRecordId(cpf, email, newId);
-    }
-
-    return data;
+    return { action: existingId ? 'updated' : 'created', ...data };
   } catch (err) {
     if ((err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT') && attempt < 3) {
       console.warn(`>> ECONNRESET/TIMEOUT - aguardando 2s e tentando novamente (${attempt}/3)...`);
@@ -291,10 +316,13 @@ app.get('/', (req, res) => {
   return res.send('Servidor server4 (cadastro inicial) online.');
 });
 
+app.get('/health', (req, res) => {
+  return res.status(200).json({ status: 'ok', service: 'server4' });
+});
+
 app.post('/rdstation-webhook', async (req, res) => {
   try {
     console.log('\n>> [server4] /rdstation-webhook recebido');
-    console.log('>> Body recebido:', JSON.stringify(req.body, null, 2));
 
     const formData = normalizeWebhookPayload(req.body);
     console.log('>> formData normalizado:', formData);
@@ -309,7 +337,6 @@ app.post('/rdstation-webhook', async (req, res) => {
     }
 
     const envisionResult = await sendFormToEnvision(formData);
-    console.log('>> Envision respondeu:', JSON.stringify(envisionResult, null, 2));
 
     return res.status(200).json({
       success: true,
@@ -330,13 +357,11 @@ app.post('/rdstation-webhook', async (req, res) => {
 app.post('/envisionform', async (req, res) => {
   try {
     console.log('\n>> [server4] /envisionform recebido');
-    console.log('>> Body recebido:', JSON.stringify(req.body, null, 2));
 
     const formData = normalizeWebhookPayload(req.body);
     console.log('>> formData normalizado:', formData);
 
     if (!formData.nomeCompleto || !formData.email) {
-      console.warn('>> Campos obrigatorios ausentes (nomeCompleto, email).');
       return res.status(400).json({
         success: false,
         error: 'Campos obrigatorios ausentes: nomeCompleto, email.',
@@ -345,7 +370,6 @@ app.post('/envisionform', async (req, res) => {
     }
 
     const envisionResult = await sendFormToEnvision(formData);
-    console.log('>> Envision respondeu:', JSON.stringify(envisionResult, null, 2));
 
     return res.status(200).json({
       success: true,
@@ -364,6 +388,5 @@ app.post('/envisionform', async (req, res) => {
 
 // ======================= START =======================
 app.listen(PORT, () => {
-  console.log(`✅ server4 (cadastro inicial) rodando em http://localhost:${PORT}`);
-  console.log(`[RecordsMap] Arquivo: ${RECORDS_MAP_FILE}`);
+  console.log(`✅ server4 (cadastro inicial) rodando na porta ${PORT}`);
 });
